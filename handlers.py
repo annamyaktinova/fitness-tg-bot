@@ -1,10 +1,14 @@
 from aiogram import Router
-from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, BufferedInputFile
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from database import Database
 from utils import get_temperature, get_food_info
+import matplotlib.pyplot as plt
+from io import BytesIO
+import pandas as pd
+import datetime
 
 router = Router()
 
@@ -78,7 +82,8 @@ async def cmd_help(message: Message):
         "/log_water <количество в мл> - записать количество выпитой воды в мл\n"
         "/log_food <название продукта> - записать еду\n"
         "/log_workout <вид тренировки> <время в мин> - записать тренировку\n"
-        "/check_progress - посмотреть прогресс"
+        "/check_progress - посмотреть прогресс за день\n"
+        "/progress_graph - посмотреть график прогресса за неделю"
     )
 
 @router.message(Command('set_profile'))
@@ -220,7 +225,8 @@ async def set_custom_goal(message: Message, state: FSMContext, db: Database):
         "/log_water - записать количество выпитой воды в мл\n"
         "/log_food - записать еду\n"
         "/log_workout - записать тренировку\n"
-        "/check_progress - посмотреть прогресс"
+        "/check_progress - посмотреть прогресс за день\n"
+        "/progress_graph - посмотреть график прогресса за неделю"
     )
     
     await state.clear()
@@ -232,6 +238,8 @@ async def cmd_log_water(message: Message, command: CommandObject, db: Database):
     if not user_data:
         await message.answer("Сначала настройте профиль: /set_profile")
         return
+    
+    today_logs = await db.get_today_logs(message.from_user.id)
 
     #Проверка введенного количества воды
     command_args = command.args
@@ -241,11 +249,11 @@ async def cmd_log_water(message: Message, command: CommandObject, db: Database):
         await message.answer("Пожалуйста, введите количество выпитой воды в мл в формате /log_water <количество>")
         return
 
-    logged_water = command_args + user_data['logged_water'] #Суммируем количество всей выпитой воды
+    logged_water = command_args + today_logs['logged_water'] #Суммируем количество всей выпитой воды
 
     remaining_water = user_data['water_goal'] - logged_water #Рассчитываем, сколько осталось выпить воды до достижения цели
 
-    await db.log_water(logged_water)
+    await db.log_water(logged_water, message.from_user.id)
 
     if remaining_water > 0:
         msg = f"Осталось: {remaining_water} мл"
@@ -308,12 +316,12 @@ async def log_food(message: Message, state: FSMContext, db: Database):
             await message.answer("Пожалуйста, введите число")
             return
 
-        consumed_calories = data['calories_100g'] * food_amount / 100 #Расчет количества потребленных калорий
+        consumed_calories = round((data['calories_100g'] * food_amount / 100), 1) #Расчет количества потребленных калорий
 
         #Логирование калорий
-        user_data = await db.get_user(message.from_user.id)
-        logged_calories = consumed_calories + user_data['logged_calories'] #Суммируем общее количество потребленных калорий
-        await db.log_calories(logged_calories)
+        today_logs = await db.get_today_logs(message.from_user.id)
+        logged_calories = consumed_calories + today_logs['logged_calories'] #Суммируем общее количество потребленных калорий
+        await db.log_calories(logged_calories, message.from_user.id)
 
         await message.answer(
             f"Записано: {consumed_calories} ккал\n"
@@ -329,6 +337,8 @@ async def cmd_log_workout(message: Message, command: CommandObject, db: Database
     if not user_data:
         await message.answer("Сначала настройте профиль: /set_profile")
         return
+    
+    today_logs = await db.get_today_logs(message.from_user.id)
 
     #Проверка введенных аргументов
     available_workout_types = ('бег', 'ходьба', 'велосипед', 'плавание', 'йога', 'силовая', 'кардио', 'танцы', 'футбол', 'баскетбол')
@@ -349,14 +359,13 @@ async def cmd_log_workout(message: Message, command: CommandObject, db: Database
         await message.answer("Пожалуйста, введите время тренировки в корректном формате (количество минут)")
         return
     
-    burned_calories = calculate_workout_calories(workout_type, workout_duration, user_data['weight'])
-    burned_calories_total = burned_calories + user_data['burned_calories'] #Суммируем общее количество сожженных калорий
+    burned_calories = round(calculate_workout_calories(workout_type, workout_duration, user_data['weight']), 1)
+    burned_calories_total = burned_calories + today_logs['burned_calories'] #Суммируем общее количество сожженных калорий
     
     # Рассчитываем дополнительную воду
     extra_water = int((int(workout_duration) / 30) * 200)
-    new_water_goal = user_data['water_goal'] + extra_water
 
-    await db.log_workout(burned_calories_total, new_water_goal)
+    await db.log_workout(burned_calories_total, message.from_user.id)
 
     await message.answer(
         f"{workout_type.capitalize()} {workout_duration} минут - сожжено {burned_calories:.0f} ккал\n"
@@ -364,15 +373,17 @@ async def cmd_log_workout(message: Message, command: CommandObject, db: Database
         )
 
 @router.message(Command('check_progress'))
-async def cmd_check_progress(message: Message, command: CommandObject, db: Database):
+async def cmd_check_progress(message: Message, db: Database):
     #Проверка наличия профиля
     user_data = await db.get_user(message.from_user.id)
     if not user_data:
         await message.answer("Сначала настройте профиль: /set_profile")
         return
+    
+    today_logs = await db.get_today_logs(message.from_user.id)
 
-    remaining_water = user_data['water_goal'] - user_data['logged_water']
-    remaining_calories = user_data['calorie_goal'] - user_data['logged_calories'] + user_data['burned_calories']
+    remaining_water = user_data['water_goal'] - today_logs['logged_water']
+    remaining_calories = user_data['calorie_goal'] - today_logs['logged_calories'] + today_logs['burned_calories']
 
     if remaining_water > 0:
         water_msg = f"- Осталось: {remaining_water} мл."
@@ -391,13 +402,67 @@ async def cmd_check_progress(message: Message, command: CommandObject, db: Datab
     await message.answer(
         "📊 Прогресс:\n"
         "Вода:\n"
-        f"- Выпито: {user_data['logged_water']} мл из {user_data['water_goal']} мл.\n" +
+        f"- Выпито: {today_logs['logged_water']} мл из {user_data['water_goal']} мл.\n" +
         water_msg +
         "\n\nКалории:\n"
-        f"- Потреблено: {user_data['logged_calories']} ккал из {user_data['calorie_goal']} ккал.\n"
-        f"- Сожжено: {user_data['burned_calories']} ккал.\n" +
+        f"- Потреблено: {today_logs['logged_calories']} ккал из {user_data['calorie_goal']} ккал.\n"
+        f"- Сожжено: {today_logs['burned_calories']} ккал.\n" +
         calories_msg
         )
+    
+@router.message(Command('progress_graph'))
+async def cmd_progress_graph(message: Message, db: Database):
+     #Проверка наличия профиля
+    user_data = await db.get_user(message.from_user.id)
+    if not user_data:
+        await message.answer("Сначала настройте профиль: /set_profile")
+        return
+    
+    water_logs, calorie_logs, burned_logs = await db.get_weekly_logs(message.from_user.id)
+    water_goal = user_data['water_goal']
+    calorie_goal = user_data['calorie_goal']
+
+    # Создаем график
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    
+    # График воды
+    today = datetime.date.today()
+    week_ago = today - datetime.timedelta(weeks=1)
+    dates = list(map(lambda x: x.strftime('%Y-%m-%d'), pd.date_range(week_ago, today)))
+    water_values = [water_logs.get(date, 0) for date in dates]
+    
+    ax1.plot(dates, water_values, color='lightblue', label='Выпито')
+    ax1.axhline(y=water_goal, color='blue', linestyle='--', label=f'Цель: {water_goal:.0f} мл')
+    ax1.set_title('Потребление воды за неделю, мл')
+    ax1.legend()
+    ax1.tick_params(axis='x', rotation=45)
+    
+    # График калорий
+    calories_values = [calorie_logs.get(date, 0) for date in dates]
+    burned_calories = [burned_logs.get(date, 0) for date in dates]
+    balance = [a - b for a, b in zip(calories_values, burned_calories)]
+
+    ax2.plot(dates, calories_values, color='lightcoral', label='Потреблено', alpha=0.5)
+    ax2.plot(dates, burned_calories, color='green', label='Сожжено', alpha=0.5)
+    ax2.plot(dates, balance, color='orange', label='Баланс')
+    ax2.axhline(y=calorie_goal, color='red', linestyle='--', label=f'Цель: {calorie_goal:.0f} ккал')
+    ax2.set_title('Потребление калорий за неделю')
+    ax2.legend()
+    ax2.tick_params(axis='x', rotation=45)
+    
+    plt.tight_layout()
+    
+    buf = BytesIO()
+    plt.savefig(buf, format='png', dpi=100)
+    buf.seek(0)
+    plt.close()
+    
+    photo=BufferedInputFile(buf.read(), filename='progress.png')
+
+    await message.answer_photo(
+        photo=photo,
+        caption="📈 Ваш прогресс за неделю"
+    )
 
 def setup_handlers(dp):
     dp.include_router(router)

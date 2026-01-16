@@ -2,3 +2,4 @@ aiogram==3.*
 aiohttp
 aiosqlite
 python-dotenv
+matplotlib

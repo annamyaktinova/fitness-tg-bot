@@ -9,7 +9,7 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     db = Database()
-    await db.create_table()
+    await db.create_tables()
 
     dp.message.middleware(LoggingMiddleware())
     dp.message.middleware(DatabaseMiddleware(db))
