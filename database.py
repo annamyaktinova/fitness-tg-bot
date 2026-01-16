@@ -129,6 +129,6 @@ class Database:
 
             water_logs = {row[0]: row[1] for row in weekly_logs}
             calorie_logs = {row[0]: row[2] for row in weekly_logs}
-            burned_logs = {row[0]: row[1] for row in weekly_logs}
+            burned_logs = {row[0]: row[3] for row in weekly_logs}
 
             return water_logs, calorie_logs, burned_logs
